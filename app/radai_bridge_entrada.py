@@ -541,10 +541,33 @@ def _dentro_do_root_do_vigia(destino):
 def conferir_destinos(destinos):
     import radai_archive
     fora = []
+    identificadas = set()
+    existentes = set()
     for d in destinos or ():
         d = str(d or "").strip()
-        if d and d not in fora:
-            fora.append(d)
+        if not d:
+            continue
+        caminho = os.path.normcase(os.path.realpath(os.path.abspath(sem_prefixo(d))))
+        if caminho in identificadas:
+            continue
+        try:
+            estado = os.stat(no_disco(caminho))
+            inode = (estado.st_dev, estado.st_ino) if estado.st_ino else None
+        except OSError:
+            inode = None
+        if inode and inode in existentes:
+            continue
+        for pai in identificadas:
+            try:
+                comum = os.path.commonpath([pai, caminho])
+            except ValueError:
+                continue
+            if comum in (pai, caminho):
+                raise EntradaRecusada("Selecione destinos separados. Uma pasta de entrega está dentro da outra.")
+        identificadas.add(caminho)
+        if inode:
+            existentes.add(inode)
+        fora.append(d)
     if not fora:
         fora = [pasta_downloads()]
     for destino in fora:
@@ -581,6 +604,8 @@ def _motivo(e):
 
 
 def _por_no_primeiro(origem, alvo, mover):
+    if os.path.lexists(no_disco(alvo)):
+        raise FileExistsError(alvo)
     if mover:
         try:
             os.rename(no_disco(origem), no_disco(alvo))
@@ -588,7 +613,12 @@ def _por_no_primeiro(origem, alvo, mover):
         except OSError:
             if os.path.exists(no_disco(alvo)):
                 raise
-    shutil.copytree(no_disco(origem), no_disco(alvo))
+    temporario = os.path.join(os.path.dirname(alvo), ".radai-entrega-" + uuid.uuid4().hex)
+    try:
+        shutil.copytree(no_disco(origem), no_disco(temporario))
+        os.rename(no_disco(temporario), no_disco(alvo))
+    finally:
+        apagar(temporario)
     if mover:
         apagar(origem)
 
@@ -610,13 +640,9 @@ def entregar(origem, destinos, linha_leia_me=u"", mover=False):
     for d in validos:
         p = os.path.join(d, nome)
         try:
-            if not pastas:
-                _por_no_primeiro(origem, p, mover)
-            else:
-                shutil.copytree(no_disco(pastas[0]), no_disco(p))
+            _por_no_primeiro(pastas[0] if pastas else origem, p, mover and not pastas)
             pastas.append(p)
         except Exception as e:
-            apagar(p)
             falhas.append((d, _motivo(e)))
     if not pastas:
         raise EntradaRecusada(

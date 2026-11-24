@@ -7,6 +7,9 @@
   "app": [
     "radai_bridge.py",
     "radai_bridge_entrada.py",
+    "radai_bridge_uids.py",
+    "radai_task_help.py",
+    "radai_task_classes.json",
     "radai_image.py",
     "radai_image_screen.py"
   ],

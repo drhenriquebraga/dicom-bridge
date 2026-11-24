@@ -379,8 +379,8 @@ def teste_um_pedido_por_serie():
                imagens and imagens[0].content[:8] == b"\x89PNG\r\n\x1a\n")
 
         cc = imagens[0].headers.get("Cache-Control", "")
-        checar(u"a miniatura pode ser guardada pelo navegador",
-               "max-age" in cc and "no-store" not in cc, cc)
+        checar(u"a miniatura em cache exige revalidação antes do reúso",
+               "no-cache" in cc and "no-store" not in cc, cc)
         checar(u"e so por ele: `private`, e nao `public`",
                "private" in cc, cc)
         etag = imagens[0].headers.get("ETag", "")
@@ -440,6 +440,8 @@ El.prototype.setAttribute = function(k, v){ this._a[k] = String(v); };
 El.prototype.getAttribute = function(k){ return this._a[k] || null; };
 El.prototype.addEventListener = function(){};
 El.prototype.appendChild = function(){};
+El.prototype.replaceChildren = function(){ this._h=''; };
+El.prototype.isConnected = true;
 El.prototype.replaceChild = function(){};
 El.prototype.click = function(){};
 El.prototype.querySelector = function(){ return null; };
@@ -495,7 +497,7 @@ DC.series = [{uid: 'x1', descricao: 'CT ABDOME', modalidade: 'CT', cortes: 12,
              {uid: 'x3', descricao: 'CT SEM', modalidade: 'CT', cortes: 8,
               bilhete: 'b_sem'}];
 DC.seg = {b_abd: {modo: 'fast', chaves: {}},
-          b_rm: {modo: 'personalizado', chaves: {total_mr: 1, vertebrae_mr: 0}},
+          b_rm: {modo: 'personalizado', chaves: {total_mr: 1, vertebrae_mr: 0}, opcionaisVisiveis:['vertebrae_mr']},
           b_sem: {modo: 'nenhuma', chaves: {}}};
 var entrega = {nome: 'DICOM_BRIDGE_X', series: [
   {b: 'b_abd', uid: '1.2.3.1', pasta: 'D1/DICOM_BRIDGE_X/s1', copias: ['D2/DICOM_BRIDGE_X/s1']},
@@ -1229,7 +1231,7 @@ def teste_o_contrato_da_fila():
            [x["uid"] for x in itens] == [u"1.2.3.1", u"1.2.3.2"], str(itens)[:200])
     a, b = itens[0], itens[1]
     checar(u"cada item tem pasta, uid, modo, chaves, copiar_rs_para, origem e rotulo",
-           all(sorted(x) == sorted(["pasta", "uid", "modo", "chaves",
+           all(sorted(x) == sorted(["pasta", "uid", "modo", "chaves", "modalidade",
                                     "copiar_rs_para", "origem", "rotulo"])
                for x in itens), str(sorted(a)))
     checar(u"  a pasta e a da serie ENTREGUE no primeiro destino",
@@ -1237,8 +1239,8 @@ def teste_o_contrato_da_fila():
     checar(u"  e copiar_rs_para sao as copias nos outros destinos",
            a["copiar_rs_para"] == [u"D2/DICOM_BRIDGE_X/s1"])
     checar(u"  o modo vai no vocabulario do contrato",
-           a["modo"] == u"fast" and b["modo"] == u"personalizado")
-    checar(u"  FAST vai sem chaves; PERSONALIZADO leva as tasks 0|1",
+           a["modo"] == u"auto" and b["modo"] == u"personalizado")
+    checar(u"  o pedido histórico FAST se converte em AUTO; PERSONALIZADO leva as tasks 0|1",
            a["chaves"] == {} and b["chaves"] == {u"total_mr": 1, u"vertebrae_mr": 0},
            str(b["chaves"]))
     checar(u"  a origem e o DicomBridge", a["origem"] == B.ORIGEM_NA_FILA
@@ -1482,9 +1484,9 @@ def teste_o_pipeline_abre_etapa_por_etapa():
            and u"zip:" not in B.JS)
     checar(u"so um cartao: /bridge/tps leva ao pipeline",
            u"RedirectResponse(url=\"/bridge/laudo\"" in fonte("radai_bridge.py"))
-    checar(u"a segmentacao por serie: nenhuma, FAST, AUTO, PERSONALIZADO",
+    checar(u"a segmentacao por serie: nenhuma, AUTO, PERSONALIZADO",
            [m[0] for m in B.MODOS_DE_SEGMENTACAO]
-           == [u"nenhuma", u"fast", u"auto", u"personalizado"])
+           == [u"nenhuma", u"auto", u"personalizado"])
     checar(u"  so CT e RM se segmentam", tuple(B.MODALIDADES_QUE_SEGMENTAM)
            == ("CT", "MR"))
     checar(u"  o PERSONALIZADO le as tasks do Rodar agora por GET so com a "

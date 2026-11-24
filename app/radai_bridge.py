@@ -12,6 +12,12 @@ import radai_viewer
 import radai_web
 
 ROTA_DA_FILA = u"/api/fila/enfileirar"
+try:
+    import radai_queue_state as _fila_host
+    if not getattr(_fila_host, "INTENCAO_EXPLICITA_BRIDGE", False):
+        ROTA_DA_FILA = u"/api/bridge/fila/enfileirar"
+except ImportError:
+    ROTA_DA_FILA = u"/api/bridge/fila/enfileirar"
 ROTA_DO_ESTADO_DA_FILA = u"/api/fila/estado"
 ROTA_DAS_OPCOES = u"/api/lote/opcoes"
 ROTA_DE_REPOR = u"/api/fila/repor"
@@ -30,7 +36,7 @@ TETO_DE_COPIAS_DO_RTSTRUCT = _teto_da_fila()
 FRASE_DO_TETO = (u"A segmentação copia o RTSTRUCT para no máximo %d outros "
                  u"destinos: tire destinos, ou entregue sem segmentação."
                  % TETO_DE_COPIAS_DO_RTSTRUCT)
-MODOS_DE_SEGMENTACAO = (("nenhuma", u"nenhuma"), ("fast", u"FAST"),
+MODOS_DE_SEGMENTACAO = (("nenhuma", u"Somente imagem para o TPS"),
                         ("auto", u"AUTO"), ("personalizado", u"PERSONALIZADO"))
 MODALIDADES_QUE_SEGMENTAM = ("CT", "MR")
 INTERVALO_DA_FILA_MS = 5000
@@ -166,6 +172,25 @@ CSS = u"""
 .dc-task{display:flex;gap:8px;align-items:flex-start;font-size:12px;color:var(--text);
  cursor:pointer}
 .dc-task input{accent-color:var(--mod-bridge);margin:2px 0 0;flex:0 0 auto}
+.dc-task input[role=switch]{appearance:none;position:relative;width:32px;height:18px;
+ border:1px solid var(--line-strong);border-radius:20px;background:var(--panel);
+ margin:0;cursor:pointer}
+.dc-task input[role=switch]::before{content:"";display:block;width:12px;height:12px;
+ border-radius:50%;background:var(--text-muted);position:absolute;left:2px;top:2px}
+.dc-task input[role=switch]:checked{background:var(--mod-bridge);border-color:var(--mod-bridge)}
+.dc-task input[role=switch]:checked::before{left:16px;background:var(--panel)}
+.dc-task input[role=switch]:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.dc-task-linha{display:flex;align-items:flex-start;gap:8px;min-width:0}
+.dc-task-linha .dc-task{flex:1;min-width:0;align-items:center}
+.dc-task-linha .tk-aj{margin:0;flex:0 0 auto}
+.dc-modelo-base{grid-column:1/-1}
+.dc-modelo-base .dc-task{flex:0 1 auto}
+.dc-catalogo-auto{grid-column:1/-1;font-size:12px;color:var(--text-muted)}
+.dc-catalogo-auto summary{cursor:pointer;width:fit-content}
+.dc-catalogo-auto .dc-task-linha{align-items:center;justify-content:space-between}
+.dc-tasks[hidden]{display:none}
+.dc-mmeta{display:block;color:var(--text-muted);font:11px/1.4 var(--font-mono);margin-top:3px}
+.dc-seg{flex-wrap:wrap;max-width:100%}
 .dc-task small{color:var(--warn);font-family:var(--font-mono);font-size:10px;margin-left:4px}
 .dc-tasks-nota{grid-column:1/-1;font-size:11.5px;color:var(--text-dim)}
 .dc-diag{display:grid;grid-template-columns:minmax(220px,.8fr) minmax(0,1.4fr);gap:16px;
@@ -334,8 +359,16 @@ function bgDestinosIniciais(){
 function bgLigarEnvio(id, aoPasta, aoErro){
  var z = bgEl(id);
  if(!z || !window.uiEnvio) return;
+ var oldFolder = z.querySelector('.ui-envio-dir');
+ if(oldFolder){
+  oldFolder.remove();
+  var folderButton = z.querySelector('[data-envio="pasta"]');
+  if(folderButton) folderButton.addEventListener('click', function(e){
+   e.preventDefault(); e.stopPropagation(); dcProcurar(folderButton);
+  });
+ }
  window.uiEnvio(z, {url: '/api/bridge/receber', fim: '/api/bridge/receber/fim',
-  pedacos: true, pagina: true, sessao: '',
+  pedacos: true, pagina: true, sessao: '', leituraLocal: true, aoEscolherPasta: dcProcurar,
   aoTerminar: function(resps){
    var d = resps[resps.length - 1] || {};
    if(d.pasta) aoPasta(d.pasta);
@@ -771,7 +804,7 @@ function dcMarcar(i){
  if(DC.marcadas[i]) delete DC.marcadas[i];
  else{
   DC.marcadas[i] = true;
-  if(!DC.seg[s.bilhete]) DC.seg[s.bilhete] = {modo: 'nenhuma', chaves: {}};
+  dcEscolhaDaSerie(s);
  }
  dcPintarMarca(i);
  dcMudouEscolha();
@@ -780,7 +813,7 @@ function dcMarcarTodas(){
  DC.series.forEach(function(s, i){
   if(dcMarcavel(s) && !DC.marcadas[i]){
    DC.marcadas[i] = true;
-   if(!DC.seg[s.bilhete]) DC.seg[s.bilhete] = {modo: 'nenhuma', chaves: {}};
+   dcEscolhaDaSerie(s);
    dcPintarMarca(i);
   }
  });
@@ -796,13 +829,55 @@ function dcMudouEscolha(){
  dcPintarBarra();
 }
 
+function dcRM(s){ return !!s && !s.imagem && String(s.modalidade || '').toUpperCase() === 'MR' }
+function dcEscolhaDaSerie(s){
+ var b = s.bilhete;
+ if(DC.seg[b]) return DC.seg[b];
+ var seg = {modo:'nenhuma', chaves:{}};
+ if(dcRM(s)){
+  try{
+   var dados=JSON.parse(sessionStorage.getItem(DC_SESSAO+'_modelos_rm')||'{}'), salvo=dados[b];
+   if(salvo && ['auto','personalizado'].indexOf(salvo.modo)>=0 && salvo.chaves && salvo.chaves.total_mr===1){
+    seg.modo=salvo.modo;
+    Object.keys(salvo.chaves).forEach(function(k){
+     if(/^[a-z][a-z0-9_]{0,80}$/.test(k)) seg.chaves[k]=salvo.chaves[k]===1?1:0;
+    });
+   }
+  }catch(e){}
+ }
+ DC.seg[b]=seg;
+ return seg;
+}
+function dcGuardarRM(s){
+ if(!dcRM(s)) return;
+ try{
+  var key=DC_SESSAO+'_modelos_rm', dados=JSON.parse(sessionStorage.getItem(key)||'{}');
+  delete dados[s.bilhete];
+  var seg=DC.seg[s.bilhete];
+  if(seg && seg.modo!=='nenhuma') dados[s.bilhete]={modo:seg.modo,chaves:seg.chaves};
+  Object.keys(dados).slice(0,-128).forEach(function(k){delete dados[k]});
+  sessionStorage.setItem(key,JSON.stringify(dados));
+ }catch(e){}
+}
+function dcPlanoDaSerie(s){
+ if(!s || s.imagem || DC_SEGMENTAM.indexOf(String(s.modalidade||'').toUpperCase())<0) return null;
+ var seg=dcEscolhaDaSerie(s);
+ if(seg.modo==='fast') seg.modo='auto';
+ if(['auto','personalizado'].indexOf(seg.modo)<0 || (dcRM(s) && seg.chaves.total_mr!==1)) return null;
+ var chaves={};
+ if(dcRM(s)){
+  chaves.total_mr=1;
+  if(seg.modo==='personalizado') (seg.opcionaisVisiveis || []).forEach(function(task){ chaves[task]=seg.chaves[task]===1?1:0 });
+ }else if(seg.modo==='personalizado') chaves=Object.assign({},seg.chaves);
+ return {modo:seg.modo, chaves:chaves};
+}
 function dcPintarMarcadas(){
  var el = bgEl('dc_marcadas'); if(!el) return;
  var m = dcMarcadas();
  if(!m.length){ el.innerHTML = ''; return }
  el.innerHTML = m.map(function(i){
-  var s = DC.series[i], b = s.bilhete, seg = DC.seg[b] || {modo: 'nenhuma', chaves: {}};
-  var pode = DC_SEGMENTAM.indexOf(String(s.modalidade || '').toUpperCase()) >= 0;
+  var s = DC.series[i], b = s.bilhete, seg = dcEscolhaDaSerie(s);
+  var pode = !s.imagem && DC_SEGMENTAM.indexOf(String(s.modalidade || '').toUpperCase()) >= 0;
   var bts = pode ? '<span class="dc-seg" role="group" aria-label="segmentação">'
     + DC_MODOS.map(function(m2){
        return '<button type="button" data-modo="' + m2[0] + '" aria-pressed="'
@@ -812,27 +887,37 @@ function dcPintarMarcadas(){
     : '<span class="dc-seg-nao" data-radai-frase>esta modalidade não se segmenta</span>';
   return '<div class="dc-mrow" id="dcr_' + bgEsc(b) + '"><div class="dc-mrow-cab">'
    + '<span class="dc-mrow-nome"><span class="mod">' + bgEsc(s.modalidade) + '</span>'
-   + bgEsc(dcNome(s)) + '</span>'
+   + bgEsc(dcNome(s)) + '<span class="dc-mmeta">' + bgEsc(s.cortes || 0) + ' ' + bgF('cortes')
+   + (s.espessura_mm ? ' · '+bgEsc(dcMm(s.espessura_mm)) : '') + '</span></span>'
    + '<span class="pp-sub" data-radai-frase>segmentação</span>' + bts + '</div>'
-   + '<div class="dc-tasks" id="dct_' + bgEsc(b) + '"' + (seg.modo === 'personalizado' ? '' : ' hidden')
+   + '<div class="dc-tasks" id="dct_' + bgEsc(b) + '"' + (pode ? '' : ' hidden')
    + '></div></div>';
  }).join('');
  m.forEach(function(i){
   var s = DC.series[i];
-  if((DC.seg[s.bilhete] || {}).modo === 'personalizado') dcPintarTasks(s.bilhete);
+  if(!s.imagem && DC_SEGMENTAM.indexOf(String(s.modalidade||'').toUpperCase())>=0) dcPintarTasks(s.bilhete);
  });
  bgTrad();
 }
 function dcModo(b, modo){
- var seg = DC.seg[b] || (DC.seg[b] = {modo: 'nenhuma', chaves: {}});
+ var s=DC.series[dcPorBilhete(b)];
+ if(!s || s.imagem) return;
+ var seg=dcEscolhaDaSerie(s);
+ if(modo==='fast') modo='auto';
+ if(['nenhuma','auto','personalizado'].indexOf(modo)<0) return;
  seg.modo = modo;
- if(modo !== 'personalizado') seg.chaves = {};
+ if(dcRM(s)){
+  if(modo==='nenhuma') seg.chaves={total_mr:0};
+  else seg.chaves.total_mr=1;
+  dcGuardarRM(s);
+ }else if(modo!=='personalizado') seg.chaves={};
  var row = bgEl('dcr_' + b);
  if(row) Array.prototype.forEach.call(row.querySelectorAll('.dc-seg button'), function(x){
   x.setAttribute('aria-pressed', x.getAttribute('data-modo') === modo ? 'true' : 'false');
  });
  var t = bgEl('dct_' + b);
- if(t){ t.hidden = modo !== 'personalizado'; if(!t.hidden) dcPintarTasks(b) }
+ if(t) dcPintarTasks(b);
+ if(DC.conversao && DC.resumoConversao) dcPintarConversao(DC.resumoConversao);
  // GUARDA: a segmentação não muda o DICOM; trocar o modo não descarta a conversão.
  dcPintarBarra();
 }
@@ -845,42 +930,111 @@ function dcOpcoes(mod){
  }
  return DC.opcoes[mod];
 }
+function dcAjudaTask(cod, nome){
+ var titulo=_tkNome('abrir a ajuda de %s').replace('%s', _tkNome(nome || cod));
+ return '<button type="button" class="tk-aj ui-ajuda" data-dc-ajuda="'+bgEsc(cod)
+  +'" aria-haspopup="dialog" aria-label="'+bgEsc(titulo)+'">?</button>';
+}
+function dcAbrirAjudaTask(q,mod){
+ if(q.getAttribute('aria-busy')==='true') return;
+ q.setAttribute('aria-busy','true');
+ var cod=q.getAttribute('data-dc-ajuda');
+ dcOpcoes(mod).then(function(d){
+  if(!q.isConnected) return;
+  var item=q.closest('.dc-modelo-base') ? d.base_item
+   : (d.tasks||[]).find(function(t){return t.task===cod});
+  if(!item) throw new Error('sem ficha');
+  var nomes=dcCatalogoPublicado.classes[(item.modelo||{}).task||item.task];
+  if(nomes && (!(item.estruturas||[]).length || item.estruturas_fonte==='ts_map'))
+   item=Object.assign({},item,{estruturas:nomes,estruturas_fonte:'TotalSegmentator '+dcCatalogoPublicado.version});
+  if(cod==='total_mr') item=Object.assign({},item,{por_que_travada:''});
+  uiAbrirFichaDaTask(item,q);
+ }).catch(function(){
+  if(q.isConnected && window.uiModal) window.uiModal({titulo:_tkNome('Ajuda'),
+   html:bgF(_tkNome('Não foi possível carregar a ficha desta tarefa.')),origem:q});
+ }).finally(function(){q.removeAttribute('aria-busy')});
+}
 function dcPintarTasks(b){
  var el = bgEl('dct_' + b), i = dcPorBilhete(b);
  if(!el || i < 0) return;
  var s = DC.series[i], seg = DC.seg[b];
  var mod = String(s.modalidade || 'CT').toUpperCase();
- el.innerHTML = '<span class="dc-tasks-nota" data-radai-frase>lendo as tasks…</span>';
+ var modo=seg.modo;
+ seg.opcionaisVisiveis=[];
+ el.hidden=false;
+ el.replaceChildren();
+ if(modo==='nenhuma'){
+  el.innerHTML='<span class="dc-tasks-nota">'+bgF('Adapta e descomprime o DICOM para o TPS, sem segmentação.')+'</span>';
+  bgTrad();
+  return;
+ }
+ var rm=dcRM(s), base=rm?'total_mr':'total_v3', nomeBase='TotalSegmentator · '+base;
+ el.innerHTML='<div class="dc-task-linha dc-modelo-base"><label class="dc-task"><input type="checkbox" role="switch" data-task="'+base+'"'
+  +(rm ? (seg.chaves.total_mr===1?' checked':'') : ' checked disabled')+'><span translate="no">'+bgEsc(nomeBase)
+  +'</span></label>'+dcAjudaTask(base,nomeBase)+'</div>';
+ el.onclick=function(ev){
+  var q=ev.target.closest('button[data-dc-ajuda]');
+  if(q){ ev.preventDefault(); ev.stopPropagation(); dcAbrirAjudaTask(q,mod) }
+ };
+ if(rm){
+  el.querySelector('[data-task="total_mr"]').addEventListener('change',function(){
+   if(!this.checked) dcModo(b,'nenhuma');
+  });
+ }
+ var extra=document.createElement('div');
+ extra.style.display='contents';
+ el.appendChild(extra);
+ if(modo==='personalizado') extra.innerHTML = '<span class="dc-tasks-nota" data-radai-frase>lendo as tasks…</span>';
  bgTrad();
  dcOpcoes(mod).then(function(d){
+  if(!extra.isConnected || DC.seg[b]!==seg || seg.modo!==modo) return;
+  if(!rm && d.base && base!==d.base){
+   var baseRow=el.querySelector('.dc-modelo-base'), rotuloBase='TotalSegmentator · '+d.base;
+   baseRow.querySelector('input').setAttribute('data-task',d.base);
+   baseRow.querySelector('label span').textContent=rotuloBase;
+   baseRow.querySelector('button').setAttribute('data-dc-ajuda',d.base);
+   baseRow.querySelector('button').setAttribute('aria-label',_tkNome('abrir a ajuda de %s').replace('%s',rotuloBase));
+  }
   var de_fabrica = d.ligadas_de_fabrica || [];
   var lista = (d.tasks || []).filter(function(t){
-   return t && t.task && t.permitida !== false && t.disponivel !== false && !t.travada;
+   return t && t.task && t.task!==d.base && t.task!=='total_mr' && t.permitida !== false && t.disponivel !== false && !t.travada;
   });
+  if(modo==='auto'){
+   extra.innerHTML='<details class="dc-catalogo-auto"><summary>'+bgF(_tkNome('Catálogo de tarefas'))+'</summary>'
+    +'<p>'+bgF(_tkNome('O AUTO escolhe as tarefas conforme a anatomia da série. Consulte aqui o que cada tarefa segmenta.'))+'</p>'
+    +'<div class="dc-tasks">'+lista.map(function(t){
+      var nome=t.caixa||t.rotulo||t.task;
+      return '<div class="dc-task-linha"><span>'+bgF(nome)+'</span>'+dcAjudaTask(t.task,nome)+'</div>';
+     }).join('')+'</div></details>';
+   bgTrad(); return;
+  }
   lista.forEach(function(t){
    if(!(t.task in seg.chaves)) seg.chaves[t.task] = (de_fabrica.indexOf(t.task) >= 0 && !t.achado) ? 1 : 0;
   });
-  el.innerHTML = '<span class="dc-tasks-nota" data-radai-frase>a base roda sempre; marque as tasks desta série</span>'
+  seg.opcionaisVisiveis=lista.map(function(t){return t.task});
+  extra.innerHTML = (dcRM(s)?'':'<span class="dc-tasks-nota" data-radai-frase>a base roda sempre; marque as tasks desta série</span>')
    + lista.map(function(t){
-      return '<label class="dc-task"><input type="checkbox" data-task="' + bgEsc(t.task) + '"'
-       + (seg.chaves[t.task] ? ' checked' : '') + '><span>' + bgEsc(t.caixa || t.rotulo || t.task)
-       + (t.achado ? '<small data-radai-frase>achado</small>' : '') + '</span></label>';
+      var rot=t.caixa || t.rotulo || t.task;
+      return '<div class="dc-task-linha"><label class="dc-task"><input type="checkbox" role="switch" data-task="' + bgEsc(t.task) + '"'
+       + (seg.chaves[t.task] ? ' checked' : '') + '><span>'+bgF(rot)
+       + (t.achado ? '<small data-radai-frase>achado</small>' : '') + '</span></label>'+dcAjudaTask(t.task,rot)+'</div>';
      }).join('');
-  Array.prototype.forEach.call(el.querySelectorAll('input[data-task]'), function(cx){
+  Array.prototype.forEach.call(extra.querySelectorAll('input[data-task]'), function(cx){
    cx.addEventListener('change', function(){
     seg.chaves[cx.getAttribute('data-task')] = cx.checked ? 1 : 0;
+    dcGuardarRM(s);
    });
   });
   bgTrad();
  }).catch(function(e){
-  el.innerHTML = '<span class="dc-tasks-nota bg-nao" data-radai-frase>as opções do PERSONALIZADO não vieram do ContourLab</span>';
+  if(!extra.isConnected || DC.seg[b]!==seg || seg.modo!==modo) return;
+  extra.innerHTML = '<span class="dc-tasks-nota bg-nao">'+bgF(_tkNome('Não foi possível carregar a ficha desta tarefa.'))+'</span>';
   bgTrad();
  });
 }
 function dcPedeSegmentacao(){
  return dcMarcadas().some(function(i){
-  var s = DC.series[i];
-  return s && (DC.seg[s.bilhete] || {}).modo && DC.seg[s.bilhete].modo !== 'nenhuma';
+  return !!dcPlanoDaSerie(DC.series[i]);
  });
 }
 
@@ -1210,11 +1364,14 @@ function dcNaoForam(d){
  return '<p class="bg-nao">' + bgF('não foram:') + ' ' + bgEsc(d.recusadas.join(' · ')) + '</p>';
 }
 function dcPintarConversao(d){
+ DC.resumoConversao=d;
  var ex = d.exportadas || [], n = ex.length;
  var h = '<p class="bg-saida"><b>' + n + '</b> ' + bgF(n === 1 ? 'série convertida' : 'séries convertidas')
    + '</p><table class="dc-tab">' + ex.map(function(x){
+    var plano=dcPlanoDaSerie(DC.series[dcPorBilhete(x.b)]);
     return '<tr><td class="mod">' + bgEsc(x.modalidade) + '</td><td>' + bgEsc(x.descricao || x.uid8)
      + '</td><td class="mod">' + (x.cortes || '?') + '</td>'
+     + '<td>'+(plano?bgF(plano.modo==='auto'?'AUTO':'PERSONALIZADO'):bgF('Somente imagem para o TPS'))+'</td>'
      + '<td class="al">' + (x.alertas && x.alertas.length ? bgIco('alerta') + '<b>'
         + x.alertas.length + '</b> ' + bgF(x.alertas.length === 1 ? 'alerta' : 'alertas') : '')
      + '</td></tr>';
@@ -1262,11 +1419,10 @@ function dcEntregar(){
 function dcItensDaFila(d){
  var fora = [];
  (d.series || []).forEach(function(x){
-  var seg = DC.seg[x.b];
-  if(!seg || !seg.modo || seg.modo === 'nenhuma') return;
-  var i = dcPorBilhete(x.b), s = DC.series[i] || {};
-  fora.push({pasta: x.pasta, uid: x.uid, modo: seg.modo,
-             chaves: seg.modo === 'personalizado' ? JSON.parse(JSON.stringify(seg.chaves || {})) : {},
+  var s=DC.series[dcPorBilhete(x.b)], plano=dcPlanoDaSerie(s);
+  if(!plano) return;
+  fora.push({pasta:x.pasta, uid:x.uid, modo:plano.modo,
+             modalidade:String(s.modalidade||'').toUpperCase(), chaves:plano.chaves,
              copiar_rs_para: (x.copias || []).slice(), origem: DC_ORIGEM,
              rotulo: (s.modalidade ? s.modalidade + ' · ' : '') + dcNome(s)});
  });
@@ -1610,7 +1766,7 @@ function dcRetomarFila(){
 
 document.addEventListener('DOMContentLoaded', function(){
  try{ bgLigarEnvio('dc_envio', function(p){ bgEl('dc_pasta').value = ''; dcCarregar(p) },
-                   function(e){ bgErro('dc_msg', 'o envio falhou', e && e.message) }) }catch(e){}
+                   function(e){ bgErro('dc_msg', 'Falha na leitura local', e && e.message) }) }catch(e){}
  try{ dcPintarGrade(); dcEtapa(1) }catch(e){}
  try{ bgDestinosIniciais() }catch(e){}
  try{ dcRetomarFila() }catch(e){}
@@ -1637,24 +1793,14 @@ FRASE = (u"Carregue suas imagens que falharam na importação, receba o "
          u"diagnóstico e processe a conversão para TPS de aceitar na fusão")
 
 AJUDA = (
-    u"Arraste o exame para a área de envio, escolha arquivos (um .zip, vários "
-    u"arquivos ou pastas) ou aponte a pasta. O que é enviado fica numa pasta de "
-    u"trabalho desta estação, fora de pasta que sincroniza, e é apagado ao "
-    u"limpar os carregamentos ou ao fechar o app.",
-    u"Clique marca a série; duplo clique abre a série para conferir, com o "
-    u"cabeçalho. Para cada série marcada, escolha a segmentação: nenhuma, "
-    u"FAST, AUTO ou PERSONALIZADO, com as tasks.",
-    u"O diagnóstico mostra só os alertas, de todas as séries escolhidas, antes "
-    u"de converter. Duas coisas impedem a conversão («não converte»): a "
-    u"compressão que este pacote não sabe abrir e o corte com a imagem "
-    u"incompleta no arquivo, que chegaria ao TPS corrompido. O resto converte, "
-    u"e o que a conversão não corrige vai gravado dentro do próprio DICOM: a "
-    u"contagem na descrição da série e o texto nos comentários da imagem. Toda "
-    u"série sai descomprimida, na sintaxe que o TPS desta estação importa, com "
-    u"os UIDs que trouxe — menos a colorida, que vira escala de cinza, e a "
-    u"série sem a posição ou a orientação dos cortes, cuja geometria a "
-    u"conversão assume: essas saem com UID novo, para nunca se misturarem com a "
-    u"original. A série sem Frame of Reference ganha um novo.",
+    u"Escolha uma pasta para ler os exames diretamente na estação. Arquivos e "
+    u"ZIPs abertos ou arrastados usam uma cópia temporária local, apagada ao limpar os "
+    u"carregamentos ou fechar o app.",
+    u"Para cada série, escolha Somente imagem para o TPS, AUTO ou PERSONALIZADO.",
+    u"A descompressão sem perda mantém os identificadores. Se a conversão alterar "
+    u"a imagem, corrigir a geometria ou acrescentar informações ao DICOM, a série "
+    u"e os cortes recebem novos identificadores. Uma cópia idêntica entra uma vez. "
+    u"Se o mesmo identificador indicar imagens diferentes, a entrega é interrompida.",
     u"A entrega é sempre uma pasta nova, DICOM_BRIDGE com a data e a hora, em "
     u"Downloads ou no destino escolhido, copiada para os outros destinos; se "
     u"um destino falha, a tela diz qual. A série com segmentação vai para o "
@@ -1683,12 +1829,17 @@ QUADRO_DO_CD = (u'<div class="dc-cd" id="dc_cd" hidden>'
 
 
 def carga(p, ao_carregar, ao_procurar, ao_limpar, rotulo):
+    import inspect
     import radai_image
     import radai_ui
+    titulo = u"Abrir exames nesta estação"
+    opcoes = dict(titulo=titulo, dica=u"Escolha a pasta do exame ou arraste arquivos e ZIPs.",
+                  imagens=u",".join(radai_image.EXTENSOES), extra=BOTAO_DO_CD)
+    if "pasta_local" in inspect.signature(radai_ui.area_de_envio).parameters:
+        opcoes["pasta_local"] = True
     return (
-        u'<section class="bg-carga" aria-label="carregar o estudo">'
-        + radai_ui.area_de_envio(p + u"_envio", extra=BOTAO_DO_CD,
-                                 imagens=u",".join(radai_image.EXTENSOES))
+        u'<section class="bg-carga" aria-label="%s">' % titulo
+        + radai_ui.area_de_envio(p + u"_envio", **opcoes)
         + u'<div class="bg-carga-pasta">'
         u'<label class="bg-carga-rot" for="%(p)s_pasta" data-radai-frase>%(rot)s'
         u'</label>'
@@ -1816,13 +1967,14 @@ def _corpo(fronteira):
 
 def pagina():
     import radai_ui
+    import radai_task_help
     css_f, tag_f = _fronteira()
     cabeca = radai_ui.cabeca_de_funcao(
         u"exportar", u"Converter imagens para o TPS", FRASE,
         radai_ui.ajuda(*AJUDA), u"bridge")
     css = (radai_viewer.CSS_UM_EIXO + CSS_COMUM + CSS + radai_image_screen.CSS
-           + css_f)
-    js = radai_viewer.JS_UM_EIXO + JS_COMUM + JS
+           + radai_task_help.CSS + css_f)
+    js = radai_viewer.JS_UM_EIXO + JS_COMUM + radai_task_help.script_bridge() + JS
     return (PAGINA.replace(u"@CSS@", css)
             .replace(u"@CABECA@", cabeca)
             .replace(u"@CORPO@", _corpo(tag_f))
@@ -1912,7 +2064,7 @@ def laudo_da_serie(serie):
 TETO_DE_GUARDAS = 64
 VALIDADE_DA_GUARDA_S = 24 * 3600.0
 CAMPOS_DO_ITEM = ("pasta", "uid", "modo", "chaves", "copiar_rs_para",
-                  "origem", "rotulo")
+                  "origem", "rotulo", "modalidade", "protocolos", "protocolos_3d")
 _TRAVA = threading.Lock()
 _ENTREGUES = {}
 _GUARDAS = {}
@@ -1942,24 +2094,127 @@ def anotar_entrega(series):
         for s in series or ():
             for p in [s.get("pasta")] + list(s.get("copias") or ()):
                 if p:
-                    _ENTREGUES[_chave_da_pasta(p)] = agora
+                    _ENTREGUES[_chave_da_pasta(p)] = (
+                        agora, s.get("uid"), str(s.get("modalidade") or "").strip().upper())
+
+
+def normalizar_item_fila(item):
+    if not isinstance(item, dict):
+        raise ValueError("Item de segmentação inválido.")
+    legado_sem_formulario = not any(k in item for k in ("modo", "modalidade", "chaves"))
+    modo = str(item.get("modo") or ("auto" if legado_sem_formulario else "nenhuma")).strip().lower()
+    if modo in ("nenhuma", "imagem", "somente_imagem"):
+        return None
+    if modo not in ("fast", "auto", "perso", "personalizado"):
+        raise ValueError("Modo de segmentação desconhecido.")
+    raw = item.get("chaves", {})
+    if not isinstance(raw, dict) or len(raw) > 300:
+        raise ValueError("As chaves das tarefas devem ser 0 ou 1.")
+    chaves = {}
+    for nome, valor in raw.items():
+        if (not isinstance(nome, str) or not nome or len(nome) > 100
+                or type(valor) not in (int, bool, str) or valor not in (0, 1, "0", "1")):
+            raise ValueError("As chaves das tarefas devem ser 0 ou 1.")
+        chaves[nome] = int(valor)
+
+    import radai_modes as md
+    import radai_tasks as rt
+    informada = str(item.get("modalidade") or "").strip().upper()
+    if informada == "RM":
+        informada = "MR"
+    with _TRAVA:
+        entrega = _ENTREGUES.get(_chave_da_pasta(item.get("pasta")))
+    if entrega and entrega[1] and entrega[1] != item.get("uid"):
+        raise ValueError("O identificador não corresponde à série DICOM entregue.")
+    verificada = entrega[2] if entrega and entrega[1] == item.get("uid") else ""
+    if informada and verificada and informada != verificada:
+        raise ValueError("A modalidade não corresponde à série DICOM entregue.")
+    mod = verificada or informada
+    if mod and mod not in ("CT", "MR"):
+        raise ValueError("Esta modalidade permite somente a entrega das imagens.")
+    bases = set(rt.BASES_CT) | set(rt.BASES_MR) | {"total"}
+    declaradas = set(chaves) & bases
+    if len(declaradas) > 1:
+        raise ValueError("Selecione apenas a base da modalidade desta série.")
+    chave_base = next(iter(declaradas), "")
+    if chave_base:
+        da_base = "MR" if chave_base in rt.BASES_MR else "CT"
+        if mod and da_base != mod:
+            raise ValueError("A base escolhida não corresponde à modalidade da série.")
+        mod = da_base
+    ativas = [t for t, v in chaves.items() if v and t not in bases]
+    protocolos = bool(item.get("protocolos") or item.get("protocolos_3d"))
+    personalizado = modo in ("perso", "personalizado")
+    if chave_base:
+        usar_base = bool(chaves[chave_base])
+    elif personalizado:
+        usar_base = bool(ativas or protocolos) and not informada
+    else:
+        usar_base = True
+    if not usar_base:
+        if ativas or protocolos:
+            raise ValueError("Ative a base da série para executar as tarefas de segmentação selecionadas.")
+        return None
+    for task in ativas:
+        spec = rt.POR_NOME.get(task)
+        if spec and mod and md._modalidade(spec["modalidade"]) != mod:
+            raise ValueError("Uma tarefa selecionada não corresponde à modalidade da série.")
+        if chave_base and spec is None:
+            import radai_batch
+            extra = ({radai_batch.CHAVE_DOS_NIVEIS} | set(radai_batch.COMPLEMENTOS_CT)
+                     | set(radai_batch.CHAVES_DOS_MOTORES_DO_FULL))
+            if mod != "CT" or task not in extra:
+                raise ValueError("Tarefa de segmentação desconhecida para esta modalidade.")
+    if chave_base and personalizado:
+        for task in md.ligadas_de_fabrica(mod):
+            chaves.setdefault(task, 0)
+    if mod and not chave_base:
+        chaves[md.base_de(mod)] = 1
+    pronto = dict(item, origem=ORIGEM_NA_FILA, modo="personalizado" if personalizado else "auto",
+                  chaves=chaves)
+    if mod:
+        pronto["modalidade"] = mod
+    return pronto
+
+
+def enfileirar_entrega(itens):
+    if not isinstance(itens, (list, tuple)) or not itens:
+        return {"ok": False, "erro": "Nenhuma série para a fila."}
+    try:
+        selecionados = [normalizar_item_fila(it) for it in itens]
+    except ValueError as exc:
+        return {"ok": False, "erro": str(exc)}
+    prontos = [it for it in selecionados if it is not None]
+    if prontos:
+        import radai_queue_state
+        resultado = radai_queue_state.enfileirar(prontos)
+    else:
+        resultado = {"ok": True, "cartoes": []}
+    if resultado.get("ok") and len(itens) != len(prontos):
+        resultado["somente_imagem"] = len(itens) - len(prontos)
+        resultado["indices_enfileirados"] = [i for i, it in enumerate(selecionados) if it is not None]
+    return resultado
 
 
 def guardar_itens(itens):
     if not isinstance(itens, (list, tuple)) or not itens:
         return u""
+    efetivos = [normalizar_item_fila(it) for it in itens]
     limpos = []
     with _TRAVA:
-        for it in itens:
-            if not isinstance(it, dict):
-                return u""
+        for it in efetivos:
+            if it is None:
+                limpos.append(None)
+                continue
             pastas = [it.get("pasta")] + list(it.get("copiar_rs_para") or ())
             # GUARDA: só se guarda o que esta tela entregou; a conferência
             # lista estas pastas no disco.
             if not it.get("uid") or not all(
                     p and _chave_da_pasta(p) in _ENTREGUES for p in pastas):
                 return u""
-            limpos.append(dict((k, it[k]) for k in CAMPOS_DO_ITEM if k in it))
+            limpos.append({k: it[k] for k in CAMPOS_DO_ITEM if k in it})
+        if not any(limpos):
+            return u""
         guarda = secrets.token_hex(16)
         _GUARDAS[guarda] = (time.time(), limpos)
         _vencer(time.time())
@@ -1969,7 +2224,7 @@ def guardar_itens(itens):
 def itens_da_guarda(guarda):
     with _TRAVA:
         v = _GUARDAS.get(str(guarda or u""))
-    return [dict(x) for x in v[1]] if v else None
+    return [dict(x) if x is not None else None for x in v[1]] if v else None
 
 
 def _quais(quais, n):
@@ -2006,6 +2261,9 @@ def conferir_guarda(guarda, quais):
     fora = []
     for i in _quais(quais, len(itens)):
         it = itens[i]
+        if it is None:
+            fora.append({"i": i, "somente_imagem": True, "rs": False, "copias": 0, "de": 0})
+            continue
         copias = [bool(_rs_ao_lado(p, it["uid"]))
                   for p in it.get("copiar_rs_para") or ()]
         fora.append({"i": i, "rs": bool(_rs_ao_lado(it["pasta"], it["uid"])),
@@ -2025,7 +2283,7 @@ def de_novo(guarda, quais):
         import radai_queue_state
     except Exception:
         return {"ok": False, "indisponivel": True, "erro": u"fila indisponível"}
-    return radai_queue_state.enfileirar([itens[i] for i in alvo])
+    return enfileirar_entrega([itens[i] or {"modo": "nenhuma"} for i in alvo])
 
 
 def montar(app):
@@ -2222,7 +2480,7 @@ def montar(app):
         except Exception:
             anterior = ""
         cabs = {"ETag": _cab(etag),
-                "Cache-Control": "private, max-age=86400",
+                "Cache-Control": "private, no-cache",
                 "X-RadAI-Corte": str(info.get("corte", 0)),
                 "X-RadAI-Cortes": str(info.get("cortes", 0)),
                 "X-RadAI-Origem": _cab(info.get("de") or "")}
@@ -2277,19 +2535,26 @@ def montar(app):
     def _converter_lote(pasta, pedidos):
         import radai_bridge_entrada as E
         import radai_dicom
+        import radai_bridge_uids as identidades
         achadas = []
+        bilhetes = set()
         for p in pedidos:
             b = str(p.get("b") or "")
+            if b and b in bilhetes:
+                continue
+            bilhetes.add(b)
             if isinstance(p.get("imagem"), dict):
                 achadas.append((b, radai_image_screen.serie_do_bilhete(b)[0],
                                 p["imagem"]))
             else:
                 achadas.append((b, _serie(pasta, b), None))
         validas = [s for _b, s, im in achadas if s is not None and im is None]
+        planos = identidades.preparar(validas, laudo_da_serie)
         subs = dict(zip([id(s) for s in validas], radai_dicom.nomes_de_subpasta(
             [str(s.get("uid") or "") for s in validas])))
         token, base = E.nova_conversao()
         exportadas, recusadas, ids = [], [], []
+        gravadas = set()
         for b, s, im in achadas:
             if s is None:
                 recusadas.append(u"série não encontrada — recarregue a pasta")
@@ -2314,19 +2579,27 @@ def montar(app):
                                    "alertas": list(r.get("alertas") or ())})
                 continue
             sub = subs[id(s)]
+            if s["uid"] in gravadas:
+                continue
             try:
-                r = radai_dicom.converter(s, os.path.join(base, sub),
-                                          laudo=laudo_da_serie(s))
+                preparada = planos[s["uid"]]
+                r = identidades.converter_preparada(preparada, os.path.join(base, sub))
             except Exception as e:
+                E.apagar(os.path.join(base, sub))
                 recusadas.append(u"%s: %s" % (s.get("descricao") or u"série",
                                               str(e)[:160]))
                 continue
+            gravadas.add(s["uid"])
             exportadas.append({"b": b, "sub": sub,
+                               "copias_identicas": preparada["ignorados"],
                                "descricao": s.get("descricao") or u"",
                                "modalidade": s.get("modalidade") or u"",
                                "cortes": r.get("cortes") or s.get("cortes"),
-                               "uid8": str(s.get("uid") or "")[-8:],
+                               "uid8": preparada["plano"]["serie_uid"][-8:],
                                "alertas": list(r.get("alertas") or ())})
+        if any(planos[u]["ligacoes"] - gravadas for u in gravadas):
+            E.esquecer_conversao(token)
+            return {"erro": recusadas[0], "recusadas": recusadas}
         if not exportadas:
             E.esquecer_conversao(token)
             return {"erro": (recusadas[0] if recusadas
@@ -2363,6 +2636,7 @@ def montar(app):
                 continue
             for x in rr["series"]:
                 series.append({"b": b, "uid": x["uid"], "pasta": alvo,
+                               "modalidade": x.get("modalidade", ""),
                                "copias": [os.path.join(p, sub)
                                           for p in pastas[1:]]})
         anotar_entrega(series)
@@ -2394,6 +2668,15 @@ def montar(app):
                 list(c.get("destinos") or ()))
         except Exception as e:
             return {"erro": u"%s: %s" % (type(e).__name__, str(e)[:200])}
+
+    @app.post("/api/bridge/fila/enfileirar")
+    async def _fila_enfileirar(request: Request):
+        try:
+            c = await request.json()
+        except ValueError:
+            return {"ok": False, "erro": "Pedido de fila inválido."}
+        itens = c.get("itens") if isinstance(c, dict) else None
+        return await radai_web.no_threadpool(enfileirar_entrega, itens)
 
     @app.post("/api/bridge/fila/guardar")
     async def _fila_guardar(request: Request):

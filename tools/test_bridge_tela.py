@@ -184,6 +184,20 @@ def montar_estudo(raiz):
     return {"tc": tc, "rm": rm}
 
 
+def uids_dos_dicoms_entregues(itens):
+    import pydicom
+    from pathlib import Path
+    por_modalidade = {}
+    for item in itens:
+        ds = [pydicom.dcmread(str(f),stop_before_pixels=True,
+                              specific_tags=["SeriesInstanceUID","Modality"])
+              for f in Path(item["pasta"]).glob("*.dcm")]
+        if not ds or {str(d.SeriesInstanceUID) for d in ds} != {item["uid"]}:
+            raise AssertionError("O item da fila não identifica o DICOM entregue.")
+        por_modalidade[str(ds[0].Modality)] = item["uid"]
+    return por_modalidade
+
+
 FRASE = (u"Carregue suas imagens que falharam na importação, receba o "
          u"diagnóstico e processe a conversão para TPS de aceitar na fusão")
 
@@ -242,17 +256,10 @@ TRADUZIDAS = (
 )
 
 NOVAS_V85 = (
-    u"O diagnóstico mostra só os alertas, de todas as séries escolhidas, antes "
-    u"de converter. Duas coisas impedem a conversão («não converte»): a "
-    u"compressão que este pacote não sabe abrir e o corte com a imagem "
-    u"incompleta no arquivo, que chegaria ao TPS corrompido. O resto converte, "
-    u"e o que a conversão não corrige vai gravado dentro do próprio DICOM: a "
-    u"contagem na descrição da série e o texto nos comentários da imagem. Toda "
-    u"série sai descomprimida, na sintaxe que o TPS desta estação importa, com "
-    u"os UIDs que trouxe — menos a colorida, que vira escala de cinza, e a "
-    u"série sem a posição ou a orientação dos cortes, cuja geometria a "
-    u"conversão assume: essas saem com UID novo, para nunca se misturarem com a "
-    u"original. A série sem Frame of Reference ganha um novo.",
+    u"A descompressão sem perda mantém os identificadores. Se a conversão alterar "
+    u"a imagem, corrigir a geometria ou acrescentar informações ao DICOM, a série "
+    u"e os cortes recebem novos identificadores. Uma cópia idêntica entra uma vez. "
+    u"Se o mesmo identificador indicar imagens diferentes, a entrega é interrompida.",
 )
 
 NOVAS_V86 = (
@@ -378,11 +385,11 @@ def teste_a_estrutura():
            _icone_da_cabeca(radai_ui.cabeca_de_funcao(u"▣", u"x", u"y"))
            != radai_ui.icone(u"exportar"))
     cartoes = [f[0] for f in M.FERRAMENTAS[u"bridge"]]
-    checar(u"a mini-página do DicomBridge tem UM cartão, o pipeline",
-           cartoes == [u"bridge_laudo"], str(cartoes))
+    checar(u"a mini-página conserva os cartões de conversão e fusão elástica",
+           cartoes == [u"bridge_laudo", u"elastic_fusao"], str(cartoes))
     mini = M.pagina(u"bridge")
-    checar(u"  e a página da mini-página leva um link só, para /bridge/laudo",
-           re.findall(r'<a class="md-fer[^"]*" href="([^"]+)"', mini) == [u"/bridge/laudo"],
+    checar(u"  e cada cartão abre uma vez a rota do próprio módulo",
+           re.findall(r'<a class="md-fer[^"]*" href="([^"]+)"', mini) == [u"/bridge/laudo",u"/bridge/elastic"],
            str(re.findall(r'<a class="md-fer[^"]*" href="([^"]+)"', mini)))
     al = re.findall(r'<div class="ui-alerta[^"]*">', pip)
     checar(u"UM alerta de rodapé", len(al) == 1, str(len(al)))
@@ -527,7 +534,7 @@ def teste_as_rotas():
     checar(u"  sem .zip", not any(n.endswith(u".zip") for n in os.listdir(d1) + os.listdir(d2)))
     sel = e.get(u"series") or []
     checar(u"para a fila: as séries ENTREGUES, com o UID e as cópias",
-           sorted(x[u"uid"] for x in sel) == sorted([uids[u"tc"], uids[u"rm"]])
+           len(sel) == 2 and set(uids_dos_dicoms_entregues(sel)) == {"CT","MR"}
            and all(x[u"pasta"].startswith(e[u"saidas"][0][u"pasta"])
                    and x[u"copias"][0].startswith(e[u"saidas"][1][u"pasta"])
                    for x in sel), str(sel)[:200])
@@ -605,7 +612,8 @@ def _aceitar(pg):
     pg.goto(BASE + "/bridge/laudo", wait_until="networkidle")
     if "/aceite" in pg.url:
         pg.wait_for_timeout(500)
-        pg.check("#ac_ok")
+        if pg.locator("#ac_ok").count():
+            pg.check("#ac_ok")
         pg.click("#ac_bt")
         pg.wait_for_timeout(1200)
 
@@ -766,13 +774,13 @@ def roteiro_pipeline(pg, estudo, uids, tmp, prints):
     pg.route("**/api/lote/opcoes*", lambda r: r.fulfill(
         status=200, content_type="application/json", body=json.dumps(OPCOES_DUBLADAS)))
     b_rm = pg.evaluate("DC.series[%d].bilhete" % i_rm)
-    pg.click("#dcr_%s .dc-seg button[data-modo=\"fast\"]" % b_tc)
+    pg.click("#dcr_%s .dc-seg button[data-modo=\"auto\"]" % b_tc)
     pg.click("#dcr_%s .dc-seg button[data-modo=\"personalizado\"]" % b_rm)
-    pg.wait_for_function("document.querySelectorAll('#dct_%s input[data-task]').length === 2" % b_rm,
+    pg.wait_for_function("document.querySelectorAll('#dct_%s input[data-task]').length === 3" % b_rm,
                          timeout=8000)
     ch = pg.evaluate("DC.seg['%s'].chaves" % b_rm)
     checar(u"o PERSONALIZADO lista as tasks permitidas, e a de achado nasce desmarcada",
-           ch == {u"vertebrae_mr": 1, u"achado_mr": 0}, str(ch))
+           ch == {u"total_mr": 1, u"vertebrae_mr": 1, u"achado_mr": 0}, str(ch))
     _print(pg, prints, "02_pipeline_escolha_1280_pt_escuro")
 
     secao(u"diagnóstico: só alertas, com o visor")
@@ -856,15 +864,16 @@ def roteiro_pipeline(pg, estudo, uids, tmp, prints):
         subs = os.listdir(os.path.join(d1, feitos[0]))
         checar(u"  com uma subpasta por série", len(subs) == 2, str(subs))
     itens = (pedidos.get("fila") or {}).get("itens") or []
+    gravados = uids_dos_dicoms_entregues(itens)
     checar(u"(C1, rota dublada) a fila recebe as duas séries ENTREGUES",
-           sorted(x.get("uid") for x in itens) == sorted([uids[u"tc"], uids[u"rm"]])
+           len(itens) == 2 and set(gravados) == {"CT","MR"}
            and all(x.get("pasta", "").startswith(os.path.join(d1, feitos[0]))
                    for x in itens), str(itens)[:200])
     por = dict((x.get("uid"), x) for x in itens)
     checar(u"  (C1) com o modo e as tasks de cada série",
-           por.get(uids[u"tc"], {}).get("modo") == u"fast"
-           and por.get(uids[u"rm"], {}).get("modo") == u"personalizado"
-           and por.get(uids[u"rm"], {}).get("chaves") == {u"vertebrae_mr": 1,
+           por.get(gravados.get("CT"), {}).get("modo") == u"auto"
+           and por.get(gravados.get("MR"), {}).get("modo") == u"personalizado"
+           and por.get(gravados.get("MR"), {}).get("chaves") == {u"total_mr": 1, u"vertebrae_mr": 1,
                                                          u"achado_mr": 0},
            str(itens)[:300])
     checar(u"  (C1) origem DicomBridge e nenhuma cópia (um destino só)",
@@ -954,10 +963,29 @@ def roteiro_envio(pg, estudo, tmp, prints):
            pg.input_value("#dc_pasta") == u"")
     checar(u"  e a origem não é oferecida como destino (veio pelo navegador)",
            pg.evaluate("BG.origem") == u"")
-    pg.set_input_files("#dc_envio .ui-envio-dir", os.path.join(estudo, u"RM"))
+    segundo = os.path.join(tmp, u"ressonancia.zip")
+    with zipfile.ZipFile(segundo, "w") as z:
+        for a in os.listdir(os.path.join(estudo, u"RM")):
+            z.write(os.path.join(estudo, u"RM", a), os.path.join(u"RM", a))
+    pg.set_input_files("#dc_envio .ui-envio-arq", segundo)
     pg.wait_for_function("DC.series.length === 2 && !DC.varre", timeout=30000)
-    checar(u"a segunda pasta escolhida SOMA à primeira (várias pastas)",
-           pg.evaluate("DC.series.length") == 2)
+    checar(u"os dois ZIPs enviados ficam disponíveis na mesma sessão",
+           sorted(pg.evaluate("DC.series.map(s=>s.modalidade)")) == ["CT","MR"])
+    envios_antes = len(pedidos)
+    choosers = []
+    pg.on("filechooser", lambda chooser: choosers.append(chooser))
+    pg.locator("#dc_envio [data-envio=pasta]").click()
+    modal = pg.locator(".ui-fp-modal")
+    modal.wait_for(state="visible")
+    pasta_rm = os.path.join(estudo, u"RM")
+    modal.locator(".ui-fp-cam").fill(pasta_rm)
+    modal.locator("[data-fp=usar]").click()
+    modal.wait_for(state="hidden")
+    pg.wait_for_function("folder=>DC.fonte===folder && !DC.varre && DC.series.length===1 && DC.series[0].modalidade==='MR'",
+                         arg=pasta_rm,timeout=30000)
+    checar(u"o seletor abre a pasta de RM como origem local, sem enviar arquivos",
+           pg.input_value("#dc_pasta") == pasta_rm and len(pedidos) == envios_antes and not choosers
+           and pg.locator("#dc_envio input[webkitdirectory]").count() == 0)
     navegou = pg.evaluate("""(function(){
       var dt = new DataTransfer();
       dt.items.add(new File([new Uint8Array([1,2,3])], 'x.bin'));

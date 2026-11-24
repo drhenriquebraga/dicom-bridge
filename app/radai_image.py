@@ -535,15 +535,19 @@ def volume(serie, teto=TETO_DO_VOLUME):
     arqs = serie.get("arquivos") or []
     if not serie.get("uniforme", True):
         raise Recusa(u"as imagens não têm todas o mesmo tamanho")
-    cortes, passo = [], 1
-    for a in arqs:
-        px = ler_cinza(a["caminho"])
-        if not cortes:
-            passo = max(1, int(-(-max(px.shape) // int(teto))))
-        cortes.append(px[::passo, ::passo])
-    if not cortes:
+    if not arqs:
         raise Recusa(u"a série está vazia")
-    return np.stack(cortes), passo
+    cortes = None
+    for i, a in enumerate(arqs):
+        px = ler_cinza(a["caminho"])
+        if cortes is None:
+            passo = max(1, int(-(-max(px.shape) // int(teto))))
+            cortes = np.empty((len(arqs),) + px[::passo, ::passo].shape, dtype=px.dtype)
+        reduzido = px[::passo, ::passo]
+        if reduzido.shape != cortes.shape[1:]:
+            raise Recusa(u"as imagens não têm todas o mesmo tamanho")
+        cortes[i] = reduzido
+    return cortes, passo
 
 
 def apresentacao_do_mpr(orientacao, corte):

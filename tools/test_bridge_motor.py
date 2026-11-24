@@ -487,9 +487,9 @@ def teste_a_colorida_vira_escala_de_cinza():
     checar(u"a captura em cinza tambem ganha ConversionType",
            str(getattr(y, "ConversionType", "")) == "WSD",
            str(getattr(y, "ConversionType", None)))
-    checar(u"e continua em escala de cinza, com os mesmos UIDs",
+    checar(u"a captura em cinza com ConversionType acrescentado tem identidade derivada",
            y.PhotometricInterpretation == "MONOCHROME2"
-           and str(y.SeriesInstanceUID) == s2["uid"])
+           and (str(y.SeriesInstanceUID) != s2["uid"]) == bool(getattr(radai_dicom, "IDENTIDADE_BRIDGE", False)))
     del np
 
 
@@ -710,6 +710,23 @@ def teste_for_ausente_nao_funde_referenciais_diferentes():
     radai_dicom.esquecer_varredura()
     s = radai_dicom.varrer(base)["series"][0]
     r, xs, erro = _converter_e_ler(s, radai_dicom)
+    if getattr(radai_dicom, "IDENTIDADE_BRIDGE", False):
+        import radai_bridge_uids as I
+        checar("dois referenciais diferentes e um ausente: a ambiguidade impede entregar",
+               not xs and I.FRAME_AMBIGUO in erro)
+        base = novo_temp()
+        serie(base, n=5, frames=[a, a, "", a, a])
+        s = radai_dicom.varrer(base)["series"][0]
+        _, xs, erro = _converter_e_ler(s, radai_dicom)
+        checar("uma pilha medida e um referencial conhecido: cinco cortes no mesmo Frame",
+               len(xs) == 5 and {str(x.FrameOfReferenceUID) for x in xs} == {a}, erro)
+        base = novo_temp()
+        serie(base, n=5, frames=[a, a, "", a, a], passo_torto=(2, 7.0))
+        s = radai_dicom.varrer(base)["series"][0]
+        _, xs, erro = _converter_e_ler(s, radai_dicom)
+        checar("um Frame ausente em pilha irregular não é atribuído por aproximação",
+               not xs and I.FRAME_AMBIGUO in erro)
+        return
     checar(u"converte", len(xs) == 5, erro)
     if not xs:
         return
@@ -747,8 +764,8 @@ def teste_o_que_nao_se_corrige_vira_alerta_e_nao_trava():
     x = ler(dcms(dest)[0])
     checar(u"e o alerta vai no DICOM",
            u"irregular" in str(getattr(x, "ImageComments", "")).lower())
-    checar(u"sem geometria inventada, os UIDs ficam",
-           str(x.SeriesInstanceUID) == s["uid"])
+    checar(u"a advertência acrescentada distingue a derivada da série recebida",
+           (str(x.SeriesInstanceUID) != s["uid"]) == bool(getattr(radai_dicom, "IDENTIDADE_BRIDGE", False)))
 
 
 def _enviar(cli, sessao, rel, dados, pedaco=7000):
@@ -1250,6 +1267,211 @@ def teste_o_corte_truncado_nao_chega_ao_tps():
                str(c)[:160])
 
 
+def teste_quatro_rm_somente_imagem_e_intencao_por_serie():
+    from fastapi import FastAPI
+    from unittest.mock import patch
+    import numpy as np
+    from pydicom.uid import RLELossless
+    import radai_batch
+    import radai_bridge as B
+    import radai_dicom
+    import radai_queue_state as Q
+
+    entrada = novo_temp()
+    originais = {}
+    for i in range(4):
+        pasta = os.path.join(entrada, "serie_%d" % i)
+        uid, _ = serie(pasta, n=3, modalidade="MR", numero=i + 1,
+                       descricao="MR FANTOMA %d" % i, comprimir=True)
+        for f in dcms(pasta):
+            ds = ler(f)
+            assert ds.file_meta.TransferSyntaxUID == RLELossless
+            originais[str(ds.SOPInstanceUID)] = (uid, ds.pixel_array.copy(), list(ds.ImagePositionPatient))
+    app = FastAPI()
+    B.montar(app)
+    Q.montar(app)
+    cli = Cliente(app)
+    radai_dicom.esquecer_varredura()
+    series = cli.post("/api/bridge/varrer", json={"pasta": entrada}).json()["series"]
+    conv = cli.post("/api/bridge/etapa/converter", json={
+        "pasta": entrada, "series": [{"b": s["bilhete"]} for s in series]}).json()
+    destino = novo_temp()
+    d = cli.post("/api/bridge/etapa/entregar", json={
+        "conversao": conv["conversao"], "destinos": [destino]}).json()
+    arquivos = [ler(f) for f in dcms(destino)]
+    checar("quatro RMs comprimidas entregues em DICOM original por série e instância",
+           len(d["series"]) == 4 and len(arquivos) == len(originais) == 12
+           and all(x["modalidade"] == "MR" for x in d["series"])
+           and all(ds.file_meta.TransferSyntaxUID == radai_dicom.sintaxe_de_saida()
+                   and not ds.file_meta.TransferSyntaxUID.is_compressed
+                   and ds.SeriesInstanceUID == originais[ds.SOPInstanceUID][0]
+                   and np.array_equal(ds.pixel_array, originais[ds.SOPInstanceUID][1])
+                   and list(ds.ImagePositionPatient) == originais[ds.SOPInstanceUID][2]
+                   for ds in arquivos))
+    itens = [{"pasta": x["pasta"], "uid": x["uid"], "modalidade": "MR", "origem": "dicombridge",
+              "modo": "personalizado", "chaves": {"total_mr": 0, "vertebrae_mr": 0}} for x in d["series"]]
+    with patch.object(Q, "_CARDS", []), patch.object(Q, "_gravar"):
+        for rota in dict.fromkeys((B.ROTA_DA_FILA, "/api/bridge/fila/enfileirar")):
+            for modo in ("nenhuma", "personalizado", "auto"):
+                resposta = cli.post(rota, json={"itens":[dict(x, modo=modo) for x in itens]}).json()
+                checar("%s: %s com todas as chaves desligadas entrega só a imagem" % (rota, modo),
+                       resposta.get("ok") and resposta["cartoes"] == []
+                       and resposta.get("somente_imagem") == 4 and not Q.cards())
+            invalidos = [dict(itens[0], modo="auto", chaves={"total_mr": 1}),
+                         dict(itens[1], chaves={"total_mr": 0, "vertebrae_mr": 1})]
+            resposta = cli.post(rota, json={"itens": invalidos}).json()
+            checar("%s: a tarefa dependente com a base desligada rejeita todo o lote" % rota,
+                   not resposta.get("ok") and "base" in resposta.get("erro", "") and not Q.cards())
+            errado = dict(itens[0], modalidade="CT", chaves={"total_v3": 1})
+            resposta = cli.post(rota, json={"itens": [errado]}).json()
+            checar("%s: a modalidade declarada precisa coincidir com o DICOM" % rota,
+                   not resposta.get("ok") and not Q.cards())
+        checar("a guarda de repetição não reativa um lote de imagens",
+               not B.guardar_itens(itens))
+        misto = [dict(itens[0], modo="auto", chaves={"total_mr": 1}),
+                 dict(itens[1], chaves={"total_mr": 1}), itens[2], itens[3]]
+        resposta = cli.post(B.ROTA_DA_FILA, json={"itens": misto}).json()
+        cartoes = Q.cards()
+        checar("lote misto: só duas escolhas explícitas produziram cartão na fila",
+               resposta.get("ok") and resposta.get("somente_imagem") == 2
+               and len(cartoes) == len(resposta.get("cartoes", [])) == 2
+               and {c["carga"]["uid"] for c in cartoes} == {itens[0]["uid"], itens[1]["uid"]})
+        carga = next(c["carga"] for c in cartoes if c["carga"]["uid"] == itens[1]["uid"])
+        escolha = radai_batch.escolha_da_serie(carga)
+        checar("personalizado com só a base planeja apenas total_mr",
+               escolha["modalidade"] == "MR" and radai_batch.tasks_do_perso(escolha) == ("total_mr",))
+        misto = [itens[3], misto[0], itens[2], misto[1]]
+        token = B.guardar_itens(misto)
+        antes = list(Q.cards())
+        repete = B.de_novo(token, [0, 2])
+        checar("repetir só as imagens de um lote misto preserva os índices e não cria cartão",
+               token and repete.get("ok") and repete.get("somente_imagem") == 2
+               and repete.get("cartoes") == [] and Q.cards() == antes
+               and all(x.get("somente_imagem") for x in B.conferir_guarda(token, [0, 2])))
+        antigo = dict(itens[2], chaves={})
+        antigo.pop("modalidade")
+        checar("personalizado antigo vazio não cria cartão; AUTO antigo conserva a escolha",
+               B.normalizar_item_fila(antigo) is None and
+               B.normalizar_item_fila(dict(antigo,modo="auto"))["modo"] == "auto")
+
+
+def teste_uids_do_lote_derivado_e_dos_destinos():
+    from pydicom.dataset import Dataset
+    from pydicom.uid import RLELossless, generate_uid
+    import radai_bridge_entrada as E
+    import radai_dicom
+    import radai_bridge_uids as I
+
+    base = novo_temp()
+    originais = []
+    for i in range(4):
+        pasta = os.path.join(base, str(i))
+        uid, sops = serie(pasta, n=5, numero=i+1, modalidade="MR", descricao="RM %d" % i,
+                          passo_torto=(3, 7.0) if i == 0 else None)
+        originais.append((uid,sops,pasta))
+    alvo = ler(sorted(dcms(originais[0][2]))[0])
+    fonte = Dataset()
+    fonte.ReferencedSOPClassUID = alvo.SOPClassUID
+    fonte.ReferencedSOPInstanceUID = alvo.SOPInstanceUID
+    fonte_serie = Dataset()
+    fonte_serie.SeriesInstanceUID = alvo.SeriesInstanceUID
+    fonte_serie.ReferencedInstanceSequence = [fonte]
+    arquivo_ref = sorted(dcms(originais[1][2]))[0]
+    ref = ler(arquivo_ref)
+    ref.ReferencedImageSequence = [fonte]
+    ref.SourceImageSequence = [fonte]
+    ref.ReferencedSeriesSequence = [fonte_serie]
+    ref.save_as(arquivo_ref, enforce_file_format=True)
+    arq_alvo = sorted(dcms(originais[0][2]))[0]
+    copia = os.path.join(originais[0][2], "copia.dcm")
+    shutil.copyfile(arq_alvo, copia)
+    comprimida = os.path.join(originais[0][2], "copia_rle.dcm")
+    codificada = ler(arq_alvo)
+    codificada.compress(RLELossless, generate_instance_uid=False)
+    codificada.save_as(comprimida, enforce_file_format=True)
+
+    cli = cliente()
+    def converter():
+        radai_dicom.esquecer_varredura()
+        vs = cli.post("/api/bridge/varrer", json={"pasta":base}).json()["series"]
+        return cli.post("/api/bridge/etapa/converter", json={
+            "pasta":base,"series":[{"b":s["bilhete"]} for s in vs]+[{"b":vs[0]["bilhete"]}]}).json()
+
+    def entregar(destinos):
+        c = converter()
+        assert c.get("conversao"), c
+        assert len(c["exportadas"]) == 4 and sum(e["copias_identicas"] for e in c["exportadas"]) == 2
+        return cli.post("/api/bridge/etapa/entregar",json={
+            "conversao":c["conversao"],"destinos":destinos}).json()
+
+    d1,d2 = novo_temp(),novo_temp()
+    e = entregar([d1, os.path.join(d1,"."), d2])
+    checar("quatro séries, duas cópias repetidas (uma reencodada), uma vez por destino físico",
+           len(e["series"]) == 4 and len(e["saidas"]) == 2 and
+           all(len(dcms(o["pasta"])) == 20 for o in e["saidas"]))
+    def dados(pasta):
+        return {(int(ds.SeriesNumber),int(ds.InstanceNumber)):ds for ds in (ler(f) for f in dcms(pasta))}
+    saida = dados(e["saidas"][0]["pasta"])
+    segunda = dados(e["saidas"][1]["pasta"])
+    repetida = dados(entregar([novo_temp()])["saidas"][0]["pasta"])
+    checar("as 20 instâncias são únicas, concordam com file_meta e se repetem idênticas nas cópias",
+           len({str(ds.SOPInstanceUID) for ds in saida.values()}) == 20 and
+           all(d.SOPInstanceUID == d.file_meta.MediaStorageSOPInstanceUID == segunda[k].SOPInstanceUID ==
+               repetida[k].SOPInstanceUID and d.SeriesInstanceUID == repetida[k].SeriesInstanceUID
+               and d.StudyInstanceUID == alvo.StudyInstanceUID for k,d in saida.items()))
+    a,b = saida[1,1],saida[2,1]
+    origem_reimportada = next(s["pasta"] for s in e["series"] if s["uid"] == a.SeriesInstanceUID)
+    serie_reimportada = radai_dicom.varrer(origem_reimportada, False)["series"][0]
+    import radai_bridge as B
+    novo_plano = I.preparar([serie_reimportada], B.laudo_da_serie)[str(a.SeriesInstanceUID)]
+    repasta = novo_temp()
+    I.converter_preparada(novo_plano, repasta)
+    segundas = [ler(f) for f in dcms(repasta)]
+    checar("uma derivada reaberta e convertida novamente mantém instâncias e anotações",
+           {str(x.SOPInstanceUID) for x in segundas} == {str(ds.SOPInstanceUID) for k,ds in saida.items() if k[0]==1}
+           and all(ds.SeriesDescription == a.SeriesDescription for ds in segundas))
+    checar("série com advertência e a série que a referencia têm UIDs novos; os dois conjuntos simples mantêm os originais",
+           all((ds.SeriesInstanceUID != originais[k[0]-1][0]) == (k[0]<=2) for k,ds in saida.items()) and
+           a.FrameOfReferenceUID == alvo.FrameOfReferenceUID and b.FrameOfReferenceUID == ref.FrameOfReferenceUID)
+    checar("referências funcionais apontam para a imagem e série derivadas; proveniência aponta para as originais",
+           b.ReferencedImageSequence[0].ReferencedSOPInstanceUID == a.SOPInstanceUID and
+           b.ReferencedSeriesSequence[0].SeriesInstanceUID == a.SeriesInstanceUID and
+           b.ReferencedSeriesSequence[0].ReferencedInstanceSequence[0].ReferencedSOPInstanceUID == a.SOPInstanceUID and
+           {s.ReferencedSOPInstanceUID for s in b.SourceImageSequence} == {alvo.SOPInstanceUID, ref.SOPInstanceUID} and
+           a.SourceImageSequence[0].ReferencedSOPInstanceUID == alvo.SOPInstanceUID)
+    try:
+        E.conferir_destinos([d1,os.path.join(d1,"sub")])
+    except E.EntradaRecusada:
+        aninhados = True
+    else:
+        aninhados = False
+    checar("destinos aninhados não deixam cópias repetidas sob a raiz de importação", aninhados)
+
+    conflito = ler(copia)
+    px = bytearray(conflito.PixelData)
+    px[0] ^= 1
+    conflito.PixelData = bytes(px)
+    conflito.save_as(copia,enforce_file_format=True)
+    resposta = converter()
+    checar("SOP repetido na mesma série com pixels diferentes bloqueia a entrega",
+           not resposta.get("conversao") and I.CONFLITO in resposta.get("erro",""))
+    shutil.copyfile(arq_alvo,copia)
+    conflito = ler(arquivo_ref)
+    conflito.SOPInstanceUID = alvo.SOPInstanceUID
+    conflito.file_meta.MediaStorageSOPInstanceUID = alvo.SOPInstanceUID
+    conflito.save_as(arquivo_ref,enforce_file_format=True)
+    resposta = converter()
+    checar("SOP repetido entre séries diferentes bloqueia o lote inteiro",
+           not resposta.get("conversao") and I.CONFLITO in resposta.get("erro",""))
+    ref.save_as(arquivo_ref,enforce_file_format=True)
+    conflito = ler(copia)
+    conflito.StudyInstanceUID = generate_uid()
+    conflito.save_as(copia,enforce_file_format=True)
+    resposta = converter()
+    checar("um Series UID compartilhado por estudos diferentes não mistura os estudos",
+           not resposta.get("conversao") and I.MISTURA in resposta.get("erro",""))
+
+
 def teste_a_guarda_da_fila():
     secao(u"a guarda da entrega: conferir no disco e por de novo, sem caminho no navegador")
     import radai_bridge as B
@@ -1316,8 +1538,7 @@ def teste_a_guarda_da_fila():
 
 def _uid64(semente):
     base = "1.2.826.0.1.3680043.8.498."
-    return base + "".join(str(1 + (semente * 7 + i * 3) % 9)
-                          for i in range(64 - len(base)))
+    return base + str(semente).ljust(64 - len(base), "8")
 
 
 def _estudo_de_caminho_longo(raiz):
@@ -1345,7 +1566,7 @@ def _estudo_de_caminho_longo(raiz):
         ds.PixelSpacing, ds.SliceThickness = [1.0, 1.0], 3.0
         ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
         ds.ImagePositionPatient = [0.0, 0.0, 3.0 * i]
-        ds.FrameOfReferenceUID = estudo
+        ds.FrameOfReferenceUID = _uid64(3)
         ds.PixelData = b"\x00\x01" * 64
         ds.save_as(os.path.join(pasta, sop + ".dcm"), enforce_file_format=True)
     return serie_uid
@@ -1404,9 +1625,10 @@ def teste_o_caminho_longo_da_area_de_envio():
             "pasta": pasta, "series": [{"b": ss[0]["bilhete"]}]}).json()
         e = cli.post("/api/bridge/etapa/entregar", json={
             "conversao": c.get("conversao"), "destinos": [novo_temp()]}).json()
-        checar(u"  e atravessa: converte e entrega com o UID preservado",
-               [x["uid"] for x in e.get("series") or []] == [uid]
-               and len(dcms(e["series"][0]["pasta"])) == 4, str(e)[:160])
+        checar(u"  e atravessa: a fila recebe o UID realmente gravado no DICOM",
+               len(e.get("series") or []) == 1
+               and {str(ler(f).SeriesInstanceUID) for f in dcms(e["series"][0]["pasta"])} == {e["series"][0]["uid"]}
+               and len(dcms(e["series"][0]["pasta"])) == 4, str(c.get("erro") or e)[:160])
     cli.post("/api/bridge/limpar", json={"sessao": sessao})
 
     zp = os.path.join(novo_temp(), "Exame.zip")
@@ -1512,6 +1734,8 @@ def main():
               teste_o_texto_declarado_no_dicom,
               teste_o_corte_truncado_nao_chega_ao_tps,
               teste_a_guarda_da_fila,
+              teste_quatro_rm_somente_imagem_e_intencao_por_serie,
+              teste_uids_do_lote_derivado_e_dos_destinos,
               teste_o_caminho_longo_da_area_de_envio,
               teste_o_envio_nao_sobra_no_temporario]
     todos = set(k for k, v in globals().items()
